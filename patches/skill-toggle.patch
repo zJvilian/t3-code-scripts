@@ -1,0 +1,765 @@
+diff --git a/apps/server/src/observability/RpcInstrumentation.ts b/apps/server/src/observability/RpcInstrumentation.ts
+index 504e533b..8f00240d 100644
+--- a/apps/server/src/observability/RpcInstrumentation.ts
++++ b/apps/server/src/observability/RpcInstrumentation.ts
+@@ -36,6 +36,7 @@ const RPC_AGGREGATES = {
+   [WS_METHODS.serverUpdateProvider]: "server",
+   [WS_METHODS.providerAuthStart]: "provider",
+   [WS_METHODS.providerConsumeResetCredit]: "provider",
++  [WS_METHODS.providerSkillSetEnabled]: "provider",
+   [WS_METHODS.providerAuthComplete]: "provider",
+   [WS_METHODS.chatGptReconnectProfile]: "provider",
+   [WS_METHODS.chatGptImportProfile]: "provider",
+diff --git a/apps/server/src/provider/Drivers/CodexDriver.ts b/apps/server/src/provider/Drivers/CodexDriver.ts
+index 2d078cf3..d5345ebe 100644
+--- a/apps/server/src/provider/Drivers/CodexDriver.ts
++++ b/apps/server/src/provider/Drivers/CodexDriver.ts
+@@ -281,6 +281,41 @@ export const CodexDriver: ProviderDriver<
+             ),
+           );
+ 
++    const setSkillEnabled: NonNullable<ProviderInstance["setSkillEnabled"]> = Effect.fn(
++      "CodexDriver.setSkillEnabled",
++    )(
++      function* (input) {
++        const { client } = yield* withCodexAppServerClient({
++          binaryPath: effectiveConfig.binaryPath,
++          homePath: effectiveConfig.homePath,
++          launchArgs: resolveCodexLaunchArgs(effectiveConfig.launchArgs, processEnv),
++          cwd: input.cwd,
++          environment: processEnv,
++        });
++        const response = yield* client.request("skills/config/write", {
++          path: input.path,
++          enabled: input.enabled,
++        });
++        if (response.effectiveEnabled !== input.enabled) {
++          return yield* Effect.fail(
++            `Codex kept the skill ${response.effectiveEnabled ? "enabled" : "disabled"}.`,
++          );
++        }
++      },
++      Effect.scoped,
++      Effect.timeout("20 seconds"),
++      Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
++      Effect.mapError(
++        (cause) =>
++          new ProviderDriverError({
++            driver: DRIVER_KIND,
++            instanceId,
++            detail: "Codex could not change this skill.",
++            cause,
++          }),
++      ),
++    );
++
+     // Redemption spends account credit; serialize by the auth.json directory, keep one idempotency key
+     // until the outcome, and bound the wait so a hung app-server cannot hold the account lock.
+     // Auth overlays use effectiveHomePath; the continuation key would conflate them with shared homes.
+@@ -348,6 +383,7 @@ export const CodexDriver: ProviderDriver<
+       enabled,
+       snapshot,
+       snapshotForCwd,
++      setSkillEnabled,
+       consumeResetCredit,
+       orchestrationAdapter,
+       textGeneration,
+diff --git a/apps/server/src/provider/ProviderRegistry.test.ts b/apps/server/src/provider/ProviderRegistry.test.ts
+index 14b8dfb2..f86a6cb5 100644
+--- a/apps/server/src/provider/ProviderRegistry.test.ts
++++ b/apps/server/src/provider/ProviderRegistry.test.ts
+@@ -1374,7 +1374,7 @@ it.layer(
+         }),
+     );
+ 
+-    it.effect("publishes workspace skills while machine health is in error", () =>
++    it.effect("publishes and updates workspace skills while machine health is in error", () =>
+       Effect.gen(function* () {
+         const driver = ProviderDriverKind.make("codex");
+         const instanceId = ProviderInstanceId.make("codex");
+@@ -1398,7 +1398,14 @@ it.layer(
+           message: "Codex app-server provider probe failed: unauthorized (401).",
+           slashCommands: [],
+         } as const satisfies ServerProvider;
+-        const firstSkills = [{ name: "first", path: "/workspace/first/SKILL.md", enabled: true }];
++        const firstSkills = [
++          {
++            name: "first",
++            path: "/home/user/.codex/skills/first/SKILL.md",
++            scope: "user",
++            enabled: true,
++          },
++        ];
+         const laterSkills = [{ name: "later", path: "/workspace/later/SKILL.md", enabled: true }];
+         const scanResult = yield* Ref.make<ProviderWorkspaceSnapshot>({
+           ...healthyProvider,
+@@ -1424,6 +1431,13 @@ it.layer(
+             applyUsageLimits: () => Effect.void,
+           },
+           snapshotForCwd: () => Ref.get(scanResult),
++          setSkillEnabled: ({ path, enabled }) =>
++            Ref.update(scanResult, (snapshot) => ({
++              ...snapshot,
++              skills: snapshot.skills.map((skill) =>
++                skill.path === path ? { ...skill, enabled } : skill,
++              ),
++            })),
+           orchestrationAdapter: {} as ProviderInstance["orchestrationAdapter"],
+           textGeneration: {} as ProviderInstance["textGeneration"],
+         };
+@@ -1460,6 +1474,13 @@ it.layer(
+           );
+           yield* registry.refreshWorkspaceSnapshot({ instanceId, cwd: "/workspace" });
+           assert.deepStrictEqual((yield* workspaceOf)?.slashCommands, [COMPACT_SLASH_COMMAND]);
++          const toggled = yield* registry.setSkillEnabled({
++            instanceId,
++            cwd: "/workspace",
++            path: firstSkills[0]!.path,
++            enabled: false,
++          });
++          assert.strictEqual(toggled[0]?.workspaceSnapshots?.[0]?.skills[0]?.enabled, false);
+ 
+           yield* TestClock.adjust(PROVIDER_WORKSPACE_SNAPSHOT_TTL_MS);
+           yield* Ref.set(scanResult, { ...unhealthyProvider, skills: laterSkills });
+diff --git a/apps/server/src/provider/ProviderRegistry.ts b/apps/server/src/provider/ProviderRegistry.ts
+index 78b11306..e23fbeb1 100644
+--- a/apps/server/src/provider/ProviderRegistry.ts
++++ b/apps/server/src/provider/ProviderRegistry.ts
+@@ -2,6 +2,7 @@ import {
+   defaultInstanceIdForDriver,
+   isProviderWorkspaceSnapshotCurrent,
+   ProviderDriverKind,
++  ProviderSetupError,
+   type ProviderInstanceId,
+   type ServerProvider,
+   type ServerProviderUpdateState,
+@@ -73,6 +74,13 @@ export class ProviderRegistry extends Context.Service<
+       readonly fresh?: boolean;
+     }) => Effect.Effect<ReadonlyArray<ServerProvider>>;
+ 
++    readonly setSkillEnabled: (input: {
++      readonly instanceId: ProviderInstanceId;
++      readonly cwd: string;
++      readonly path: string;
++      readonly enabled: boolean;
++    }) => Effect.Effect<ReadonlyArray<ServerProvider>, ProviderSetupError>;
++
+     readonly getProviderMaintenanceCapabilitiesForInstance: (
+       instanceId: ProviderInstanceId,
+       provider: ProviderDriverKind,
+@@ -1002,6 +1010,64 @@ export const layer = Layer.effect(
+       return yield* Fiber.join(claim.scan);
+     });
+ 
++    const setSkillEnabled = Effect.fn("ProviderRegistry.setSkillEnabled")(function* (input: {
++      readonly instanceId: ProviderInstanceId;
++      readonly cwd: string;
++      readonly path: string;
++      readonly enabled: boolean;
++    }) {
++      const providers = yield* Ref.get(providersRef);
++      const provider = providers.find((candidate) => candidate.instanceId === input.instanceId);
++      const skills =
++        provider?.workspaceSnapshots?.find((snapshot) => snapshot.cwd === input.cwd)?.skills ??
++        provider?.skills ??
++        [];
++      const skill = skills.find((candidate) => candidate.path === input.path);
++      const scope = skill?.scope?.trim().toLowerCase();
++      if (!skill || (scope !== "user" && scope !== "personal")) {
++        return yield* new ProviderSetupError({
++          instanceId: input.instanceId,
++          operation: "set-skill-enabled",
++          detail: "Only discovered personal skills can be changed.",
++        });
++      }
++
++      const instance = yield* instanceRegistry.getInstance(input.instanceId);
++      if (!instance?.setSkillEnabled) {
++        return yield* new ProviderSetupError({
++          instanceId: input.instanceId,
++          operation: "set-skill-enabled",
++          detail: "This provider does not support changing skills.",
++        });
++      }
++      yield* instance
++        .setSkillEnabled({ cwd: input.cwd, path: input.path, enabled: input.enabled })
++        .pipe(
++          Effect.mapError(
++            (cause) =>
++              new ProviderSetupError({
++                instanceId: input.instanceId,
++                operation: "set-skill-enabled",
++                detail: cause.message,
++              }),
++          ),
++        );
++      return yield* refreshWorkspaceSnapshot({
++        instanceId: input.instanceId,
++        cwd: input.cwd,
++        fresh: true,
++      }).pipe(
++        Effect.mapError(
++          (cause) =>
++            new ProviderSetupError({
++              instanceId: input.instanceId,
++              operation: "set-skill-enabled",
++              detail: cause.message,
++            }),
++        ),
++      );
++    });
++
+     return {
+       getProviders: Ref.get(providersRef),
+       refresh: (provider?: ProviderDriverKind) =>
+@@ -1010,6 +1076,7 @@ export const layer = Layer.effect(
+         refreshInstance(instanceId).pipe(Effect.catchCause(recoverRefreshFailure)),
+       refreshWorkspaceSnapshot: (input) =>
+         refreshWorkspaceSnapshot(input).pipe(Effect.catchCause(recoverRefreshFailure)),
++      setSkillEnabled,
+       refreshAfterUpdate,
+       getProviderMaintenanceCapabilitiesForInstance,
+       setProviderMaintenanceActionState,
+diff --git a/apps/server/src/provider/providerMaintenanceRunner.test.ts b/apps/server/src/provider/providerMaintenanceRunner.test.ts
+index 75c592b7..8df9c09d 100644
+--- a/apps/server/src/provider/providerMaintenanceRunner.test.ts
++++ b/apps/server/src/provider/providerMaintenanceRunner.test.ts
+@@ -194,6 +194,7 @@ function makeRegistry(
+       refreshInstance: () => Ref.get(providersRef),
+       refreshAfterUpdate: () => Ref.get(providersRef),
+       refreshWorkspaceSnapshot: () => Ref.get(providersRef),
++      setSkillEnabled: () => Ref.get(providersRef),
+       getProviderMaintenanceCapabilitiesForInstance: (_instanceId, provider) =>
+         Effect.succeed(lifecycleFor(provider)),
+       setProviderMaintenanceActionState,
+diff --git a/apps/server/src/provider/testUtils/providerRegistryMock.ts b/apps/server/src/provider/testUtils/providerRegistryMock.ts
+index 358d49af..250bbfa9 100644
+--- a/apps/server/src/provider/testUtils/providerRegistryMock.ts
++++ b/apps/server/src/provider/testUtils/providerRegistryMock.ts
+@@ -13,6 +13,7 @@ const makeProviderRegistryMock = (
+   refreshInstance: () => Effect.succeed(providers),
+   refreshAfterUpdate: () => Effect.succeed(providers),
+   refreshWorkspaceSnapshot: () => Effect.succeed(providers),
++  setSkillEnabled: () => Effect.succeed(providers),
+   getProviderMaintenanceCapabilitiesForInstance: (_instanceId, provider) =>
+     Effect.succeed(makeManualOnlyProviderMaintenanceCapabilities({ provider, packageName: null })),
+   setProviderMaintenanceActionState: () => Effect.succeed(providers),
+diff --git a/apps/server/src/ws.ts b/apps/server/src/ws.ts
+index e1d6303b..f0a5d93a 100644
+--- a/apps/server/src/ws.ts
++++ b/apps/server/src/ws.ts
+@@ -2448,6 +2448,22 @@ export const layerWsRpc = (
+             );
+             return { outcome };
+           }),
++        [WS_METHODS.providerSkillSetEnabled]: (input) =>
++          providerRegistry.setSkillEnabled(input).pipe(
++            Effect.map((providers) => ({
++              providers: providers
++                .filter((provider) => provider.instanceId === input.instanceId)
++                .map((provider) => ({
++                  ...provider,
++                  models: [],
++                  slashCommands: [],
++                  skills: [],
++                  workspaceSnapshots: (provider.workspaceSnapshots ?? []).filter(
++                    (snapshot) => snapshot.cwd === input.cwd,
++                  ),
++                })),
++            })),
++          ),
+         [WS_METHODS.providerAuthStart]: (input) => providerAuth.start(input, currentSessionId),
+         [WS_METHODS.providerAuthRespond]: (input) =>
+           Effect.annotateCurrentSpan({ instanceId: input.instanceId }).pipe(
+diff --git a/apps/web/src/components/chat/ChatComposer.tsx b/apps/web/src/components/chat/ChatComposer.tsx
+index 57838e59..90519e9f 100644
+--- a/apps/web/src/components/chat/ChatComposer.tsx
++++ b/apps/web/src/components/chat/ChatComposer.tsx
+@@ -255,6 +255,7 @@ import type { ContextWindowSnapshot } from "../../lib/contextWindow";
+ import {
+   resolveProviderSkillsForCwd,
+   resolveProviderSlashCommandsForCwd,
++  resolveProviderSkillSourceKind,
+ } from "@t3tools/client-runtime/providerSkills";
+ import { useMediaQuery } from "../../hooks/useMediaQuery";
+ import { useSoftwareKeyboardOpen } from "../../hooks/useSoftwareKeyboardOpen";
+@@ -498,6 +499,7 @@ export interface ChatComposerProps {
+ 
+ const NO_PROVIDER_SKILLS: ServerProvider["skills"] = [];
+ const NO_PROVIDER_SLASH_COMMANDS: ServerProvider["slashCommands"] = [];
++const CODEX_PROVIDER = ProviderDriverKind.make("codex");
+ 
+ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps) {
+   const {
+@@ -927,6 +929,12 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
+   const selectedProviderSkills = selectedProviderStatus
+     ? resolveProviderSkillsForCwd(selectedProviderStatus, gitCwd)
+     : NO_PROVIDER_SKILLS;
++  const personalSkills =
++    selectedProvider === CODEX_PROVIDER
++      ? selectedProviderSkills.filter(
++          (skill) => resolveProviderSkillSourceKind(skill) === "personal",
++        )
++      : null;
+   const selectedProviderSlashCommands = selectedProviderStatus
+     ? resolveProviderSlashCommandsForCwd(selectedProviderStatus, gitCwd)
+     : NO_PROVIDER_SLASH_COMMANDS;
+@@ -2298,6 +2306,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
+       selectedInstanceId={selectedInstanceId}
+       selectedModel={selectedModel}
+       selectedProviderModels={selectedProviderModels}
++      personalSkills={personalSkills}
++      skillsCwd={gitCwd}
+       composerModelOptions={composerModelOptions}
+       reportedModelSelection={reportedModelSelection}
+       promptUltrathink={promptUltrathink}
+diff --git a/apps/web/src/components/chat/CompactComposerControlsMenu.tsx b/apps/web/src/components/chat/CompactComposerControlsMenu.tsx
+index 68ea2036..b2bab108 100644
+--- a/apps/web/src/components/chat/CompactComposerControlsMenu.tsx
++++ b/apps/web/src/components/chat/CompactComposerControlsMenu.tsx
+@@ -20,6 +20,7 @@ export const CompactComposerControlsMenu = memo(function CompactComposerControls
+   runtimeModeOptions: ReadonlyArray<RuntimeModeOption>;
+   showInteractionModeToggle: boolean;
+   traitsMenuContent?: ReactNode;
++  skillsMenuContent?: ReactNode;
+   showPermissions?: boolean;
+   size?: "sm" | "xs";
+   /** Close the portaled popup when its trigger hides. */
+@@ -62,7 +63,9 @@ export const CompactComposerControlsMenu = memo(function CompactComposerControls
+         {props.traitsMenuContent ? (
+           <>
+             {props.traitsMenuContent}
+-            {props.showInteractionModeToggle || props.showPermissions !== false ? (
++            {props.showInteractionModeToggle ||
++            props.skillsMenuContent ||
++            props.showPermissions !== false ? (
+               <MenuDivider />
+             ) : null}
+           </>
+@@ -80,6 +83,12 @@ export const CompactComposerControlsMenu = memo(function CompactComposerControls
+               <MenuRadioItem value="default">Chat</MenuRadioItem>
+               <MenuRadioItem value="plan">Plan</MenuRadioItem>
+             </MenuRadioGroup>
++            {props.skillsMenuContent || props.showPermissions !== false ? <MenuDivider /> : null}
++          </>
++        ) : null}
++        {props.skillsMenuContent ? (
++          <>
++            {props.skillsMenuContent}
+             {props.showPermissions !== false ? <MenuDivider /> : null}
+           </>
+         ) : null}
+diff --git a/apps/web/src/components/chat/ComposerControlsBar.tsx b/apps/web/src/components/chat/ComposerControlsBar.tsx
+index 4dd54739..252b54e0 100644
+--- a/apps/web/src/components/chat/ComposerControlsBar.tsx
++++ b/apps/web/src/components/chat/ComposerControlsBar.tsx
+@@ -19,6 +19,7 @@ import {
+   type ProviderInteractionMode,
+   type RuntimeMode,
+   type ServerProvider,
++  type ServerProviderSkill,
+ } from "@t3tools/contracts";
+ import type { EffortDisplay } from "@t3tools/contracts/settings";
+ import { cn } from "~/lib/utils";
+@@ -29,6 +30,7 @@ import {
+ } from "./composerProviderState";
+ import type { useComposerProviderModel } from "./useComposerProviderModel";
+ import { resolveComposerControlsOwnership } from "./composerControlsOwnership";
++import { ComposerSkillsMenu, ComposerSkillsSection } from "./ComposerSkillsMenu";
+ 
+ /**
+  * The composer footer controls: model picker, traits, mode controls and the overflow menu for
+@@ -47,6 +49,8 @@ export function ComposerControlsBar(props: {
+   selectedInstanceId: ProviderInstanceId;
+   selectedModel: string;
+   selectedProviderModels: ServerProvider["models"];
++  personalSkills: ReadonlyArray<ServerProviderSkill> | null;
++  skillsCwd: string | null;
+   composerModelOptions: ReturnType<typeof useComposerProviderModel>["composerModelOptions"];
+   reportedModelSelection: ChatComposerProps["reportedModelSelection"];
+   promptUltrathink: PromptUltrathink;
+@@ -98,6 +102,8 @@ export function ComposerControlsBar(props: {
+     selectedInstanceId,
+     selectedModel,
+     selectedProviderModels,
++    personalSkills,
++    skillsCwd,
+     composerModelOptions,
+     reportedModelSelection,
+     promptUltrathink,
+@@ -152,6 +158,7 @@ export function ComposerControlsBar(props: {
+   });
+   const accessMatchesDefault = compatibleRuntimeMode === defaultRuntimeMode;
+   const permissionsChipHidden = accessMatchesDefault || props.permissionsShownInStrip;
++  const hasPersonalSkills = skillsCwd !== null && personalSkills !== null;
+   const providerTraitsPickerInput = {
+     provider: selectedProvider,
+     instanceId: selectedInstanceId,
+@@ -201,6 +208,7 @@ export function ComposerControlsBar(props: {
+   } = resolveComposerControlsOwnership({
+     matchesDefault: permissionsChipHidden,
+     hasTraits: providerTraitsPicker !== null,
++    hasSkills: hasPersonalSkills,
+     planModeUiEnabled,
+     collapsed: composerControlsCollapsed,
+     measuredHiddenBlockCount,
+@@ -211,6 +219,15 @@ export function ComposerControlsBar(props: {
+     hidden: composerControlsHidden || traitsBlockHidden,
+     extraMenuOwnsModeShortcut: effortOwnsModeShortcut,
+   });
++  const skillsProps =
++    skillsCwd !== null && personalSkills !== null
++      ? {
++          environmentId,
++          instanceId: selectedInstanceId,
++          cwd: skillsCwd,
++          skills: personalSkills,
++        }
++      : null;
+   const restingBlockDefs = [
+     ...(providerTraitsPicker
+       ? [
+@@ -241,6 +258,20 @@ export function ComposerControlsBar(props: {
+             ),
+           },
+         ]),
++    ...(skillsProps
++      ? [
++          {
++            id: "skills",
++            content: (
++              <ComposerSkillsMenu
++                {...skillsProps}
++                size={composerControlsCollapsed ? "xs" : "sm"}
++                hidden={composerControlsHidden || restingHiddenBlockCount > 0}
++              />
++            ),
++          },
++        ]
++      : []),
+   ];
+   // Its own element, so typing (which rebuilds the controls around it) leaves it cached.
+   const composerModelPicker = (
+@@ -351,6 +382,11 @@ export function ComposerControlsBar(props: {
+             traitsMenuContent={
+               hiddenRestingBlockIds.includes("traits") ? providerTraitsMenuContent : undefined
+             }
++            skillsMenuContent={
++              skillsProps && hiddenRestingBlockIds.includes("skills") ? (
++                <ComposerSkillsSection {...skillsProps} />
++              ) : undefined
++            }
+             // Permissions join the overflow only when their normal home is in it.
+             showPermissions={overflowShowsPermissions}
+             onToggleInteractionMode={toggleInteractionMode}
+diff --git a/apps/web/src/components/chat/composerControlsOwnership.test.ts b/apps/web/src/components/chat/composerControlsOwnership.test.ts
+index 92ce7bdb..c72ae2ec 100644
+--- a/apps/web/src/components/chat/composerControlsOwnership.test.ts
++++ b/apps/web/src/components/chat/composerControlsOwnership.test.ts
+@@ -5,6 +5,7 @@ import { resolveComposerControlsOwnership } from "./composerControlsOwnership";
+ const base = {
+   matchesDefault: true,
+   hasTraits: true,
++  hasSkills: false,
+   planModeUiEnabled: false,
+   collapsed: false,
+   measuredHiddenBlockCount: 0,
+@@ -87,4 +88,13 @@ describe("resolveComposerControlsOwnership", () => {
+     });
+     expect(result.accessDisplay).toBe("icon");
+   });
++
++  it("overflows personal skills before the other controls", () => {
++    const result = resolveComposerControlsOwnership({
++      ...base,
++      hasSkills: true,
++      measuredHiddenBlockCount: 1,
++    });
++    expect(result.hiddenBlockIds).toEqual(["skills"]);
++  });
+ });
+diff --git a/apps/web/src/components/chat/composerControlsOwnership.ts b/apps/web/src/components/chat/composerControlsOwnership.ts
+index 5c1996c0..cadba184 100644
+--- a/apps/web/src/components/chat/composerControlsOwnership.ts
++++ b/apps/web/src/components/chat/composerControlsOwnership.ts
+@@ -1,6 +1,6 @@
+ /**
+  * Where the permissions control lives, which blocks overflow, and which menu answers the
+- * composer.mode shortcut. Blocks are ordered [traits, mode]; the last block overflows first.
++ * composer.mode shortcut. Blocks are ordered [traits, mode, skills]; the last block overflows first.
+  * The rule: Permissions have exactly one visible home and composer.mode exactly one target.
+  */
+ export function resolveComposerControlsOwnership(input: {
+@@ -8,6 +8,7 @@ export function resolveComposerControlsOwnership(input: {
+   readonly matchesDefault: boolean;
+   /** The model has an effort (traits) menu, which then always holds Permissions. */
+   readonly hasTraits: boolean;
++  readonly hasSkills: boolean;
+   readonly planModeUiEnabled: boolean;
+   readonly collapsed: boolean;
+   /** How many trailing blocks the width measurement moved into the overflow menu. */
+@@ -25,6 +26,7 @@ export function resolveComposerControlsOwnership(input: {
+   const blockIds = [
+     ...(input.hasTraits ? ["traits" as const] : []),
+     ...(showModeBlock ? ["mode" as const] : []),
++    ...(input.hasSkills ? ["skills" as const] : []),
+   ];
+   const hiddenFor = (count: number) => blockIds.slice(blockIds.length - count);
+   const overflowShowsPermissionsFor = (hidden: ReadonlyArray<string>) =>
+@@ -32,6 +34,7 @@ export function resolveComposerControlsOwnership(input: {
+   const overflowHasContent = (hidden: ReadonlyArray<string>) =>
+     hidden.includes("traits") ||
+     (input.planModeUiEnabled && hidden.includes("mode")) ||
++    hidden.includes("skills") ||
+     overflowShowsPermissionsFor(hidden);
+ 
+   let hiddenBlockCount = Math.min(input.measuredHiddenBlockCount, blockIds.length);
+diff --git a/packages/client-runtime/src/state/server.ts b/packages/client-runtime/src/state/server.ts
+index c8ce8b38..d3bc04b4 100644
+--- a/packages/client-runtime/src/state/server.ts
++++ b/packages/client-runtime/src/state/server.ts
+@@ -1369,6 +1369,28 @@ export function createServerEnvironmentAtoms<R, E>(
+           ]),
+       },
+     }),
++    setProviderSkillEnabled: createEnvironmentRpcCommand(runtime, {
++      label: "environment-data:provider:set-skill-enabled",
++      tag: WS_METHODS.providerSkillSetEnabled,
++      onSuccess: ({ environmentId, input }, registry, result) =>
++        Effect.sync(() => {
++          registry.update(fetchedWorkspaceSnapshotsAtom(environmentId), (current) =>
++            recordFetchedWorkspaceSnapshot(
++              current,
++              { instanceId: input.instanceId, cwd: input.cwd, fresh: true },
++              result.providers,
++              registry
++                .get(configValueAtom(environmentId))
++                ?.providers.find((provider) => provider.instanceId === input.instanceId),
++            ),
++          );
++        }),
++      concurrency: {
++        mode: "singleFlight",
++        key: ({ environmentId, input }) =>
++          JSON.stringify([environmentId, input.instanceId, input.cwd, input.path]),
++      },
++    }),
+     updateProvider: createEnvironmentRpcCommand(runtime, {
+       label: "environment-data:server:update-provider",
+       tag: WS_METHODS.serverUpdateProvider,
+diff --git a/packages/contracts/src/clientRpcPermissions.ts b/packages/contracts/src/clientRpcPermissions.ts
+index 3cd80fee..f5f3e5ec 100644
+--- a/packages/contracts/src/clientRpcPermissions.ts
++++ b/packages/contracts/src/clientRpcPermissions.ts
+@@ -20,6 +20,7 @@ export const CLIENT_GUARDED_RPC_SCOPES = {
+   [WS_METHODS.previewStopLocalServer]: AuthTerminalOperateScope,
+   [WS_METHODS.serverRunStorageCleanup]: AuthSettingsWriteScope,
+   [WS_METHODS.serverCheckOtlpEndpoint]: AuthSettingsWriteScope,
++  [WS_METHODS.providerSkillSetEnabled]: AuthSettingsWriteScope,
+   [WS_METHODS.pullRequestsRunAction]: AuthSourceControlWriteScope,
+   [WS_METHODS.pullRequestsUpdate]: AuthSourceControlWriteScope,
+   [WS_METHODS.pullRequestsComment]: AuthSourceControlWriteScope,
+diff --git a/packages/contracts/src/rpc.ts b/packages/contracts/src/rpc.ts
+index e4823f30..54465520 100644
+--- a/packages/contracts/src/rpc.ts
++++ b/packages/contracts/src/rpc.ts
+@@ -420,6 +420,7 @@ export const WS_METHODS = {
+   mcpAppsUpdateModelContext: "mcpApps.updateModelContext",
+ 
+   providerUploadFeedback: "provider.uploadFeedback",
++  providerSkillSetEnabled: "provider.skill.setEnabled",
+   providerAuthStart: "provider.auth.start",
+   providerConsumeResetCredit: "provider.consumeResetCredit",
+   providerAuthComplete: "provider.auth.complete",
+@@ -653,6 +654,17 @@ const WsProviderConsumeResetCreditRpc = Rpc.make(WS_METHODS.providerConsumeReset
+   error: Schema.Union([ProviderSetupError, UsageLimitSourceError, EnvironmentAuthorizationError]),
+ });
+ 
++const WsProviderSkillSetEnabledRpc = Rpc.make(WS_METHODS.providerSkillSetEnabled, {
++  payload: Schema.Struct({
++    instanceId: ProviderInstanceId,
++    cwd: TrimmedNonEmptyString,
++    path: TrimmedNonEmptyString,
++    enabled: Schema.Boolean,
++  }),
++  success: ServerProviderUpdatedPayload,
++  error: ProviderSetupRpcError,
++});
++
+ const WsProviderAuthStartRpc = Rpc.make(WS_METHODS.providerAuthStart, {
+   payload: ProviderAuthStartInput,
+   success: ProviderAuthState,
+@@ -1920,6 +1932,7 @@ export const WsRpcGroup = RpcGroup.make(
+   WsServerRefreshProvidersRpc,
+   WsServerUpdateProviderRpc,
+   WsProviderConsumeResetCreditRpc,
++  WsProviderSkillSetEnabledRpc,
+   WsProviderAuthStartRpc,
+   WsProviderAuthCompleteRpc,
+   WsChatGptReconnectProfileRpc,
+diff --git a/packages/provider-core/src/server/driver.ts b/packages/provider-core/src/server/driver.ts
+index d236a98f..5cefc63a 100644
+--- a/packages/provider-core/src/server/driver.ts
++++ b/packages/provider-core/src/server/driver.ts
+@@ -45,6 +45,11 @@ export interface ProviderInstance {
+   ) => Effect.Effect<ProviderWorkspaceSnapshot, ProviderDriverError>;
+   readonly refreshModels?: () => Effect.Effect<void, ProviderDriverError>;
+   readonly invalidateCaches?: Effect.Effect<void>;
++  readonly setSkillEnabled?: (input: {
++    readonly cwd: string;
++    readonly path: string;
++    readonly enabled: boolean;
++  }) => Effect.Effect<void, ProviderDriverError>;
+   readonly consumeResetCredit?: () => Effect.Effect<
+     ProviderConsumeResetCreditOutcome,
+     ProviderDriverError
+diff --git a/apps/web/src/components/chat/ComposerSkillsMenu.browser.test.tsx b/apps/web/src/components/chat/ComposerSkillsMenu.browser.test.tsx
+new file mode 100644
+--- /dev/null
++++ b/apps/web/src/components/chat/ComposerSkillsMenu.browser.test.tsx
+@@ -0,0 +1,46 @@
++import { EnvironmentId, ProviderInstanceId } from "@t3tools/contracts";
++import { expect, it, vi } from "vite-plus/test";
++import { page, userEvent } from "vite-plus/test/browser";
++
++import { render } from "../../../test/render";
++import { ComposerSkillsMenu } from "./ComposerSkillsMenu";
++
++const state = vi.hoisted(() => ({ setSkillEnabled: vi.fn() }));
++
++vi.mock("../../state/server", () => ({
++  serverEnvironment: { setProviderSkillEnabled: "setProviderSkillEnabled" },
++}));
++vi.mock("../../state/use-atom-command", () => ({
++  useAtomCommand: () => state.setSkillEnabled,
++}));
++
++it("toggles a personal skill from the composer menu", async () => {
++  state.setSkillEnabled.mockReset().mockResolvedValue({ _tag: "Success" });
++  const environmentId = EnvironmentId.make("test-environment");
++  const instanceId = ProviderInstanceId.make("codex");
++  const path = "/home/user/.codex/skills/ponytail/SKILL.md";
++  const props = { environmentId, instanceId, cwd: "/workspace" };
++  await using screen = await render(
++    <ComposerSkillsMenu {...props} skills={[]} />,
++    { router: false }, // no routes involved
++  );
++
++  await userEvent.click(screen.getByRole("button", { name: "Personal skills" }));
++  await expect.element(page.getByText("No personal skills found.")).toBeVisible();
++  await screen.rerender(
++    <ComposerSkillsMenu
++      {...props}
++      skills={[{ name: "ponytail", displayName: "Ponytail", path, scope: "user", enabled: false }]}
++    />,
++  );
++  const skill = page.getByRole("menuitemcheckbox", { name: "Ponytail" });
++  await expect.element(skill).toHaveAttribute("aria-checked", "false");
++  await userEvent.click(skill);
++
++  await vi.waitFor(() =>
++    expect(state.setSkillEnabled).toHaveBeenCalledWith({
++      environmentId,
++      input: { instanceId, cwd: "/workspace", path, enabled: true },
++    }),
++  );
++});
+diff --git a/apps/web/src/components/chat/ComposerSkillsMenu.tsx b/apps/web/src/components/chat/ComposerSkillsMenu.tsx
+new file mode 100644
+--- /dev/null
++++ b/apps/web/src/components/chat/ComposerSkillsMenu.tsx
+@@ -0,0 +1,94 @@
++import type { EnvironmentId, ProviderInstanceId, ServerProviderSkill } from "@t3tools/contracts";
++import { SparklesIcon } from "lucide-react";
++import { memo, useState } from "react";
++
++import { serverEnvironment } from "../../state/server";
++import { useAtomCommand } from "../../state/use-atom-command";
++import {
++  Menu,
++  MenuCheckboxItem,
++  MenuGroup,
++  MenuGroupLabel,
++  MenuPopup,
++  MenuTrigger,
++} from "../ui/menu";
++import { ComposerControl, ComposerControlIcon } from "./ComposerControl";
++import { useComposerMenuProps } from "./composerEventScope";
++import { useComposerMenuState } from "./useComposerMenuState";
++
++type SkillsProps = {
++  environmentId: EnvironmentId;
++  instanceId: ProviderInstanceId;
++  cwd: string;
++  skills: ReadonlyArray<ServerProviderSkill>;
++};
++
++export function ComposerSkillsSection(props: SkillsProps) {
++  const setSkillEnabled = useAtomCommand(serverEnvironment.setProviderSkillEnabled, {
++    label: "change personal skill",
++  });
++  const [pendingPath, setPendingPath] = useState<string | null>(null);
++
++  const toggleSkill = async (skill: ServerProviderSkill, enabled: boolean) => {
++    setPendingPath(skill.path);
++    await setSkillEnabled({
++      environmentId: props.environmentId,
++      input: {
++        instanceId: props.instanceId,
++        cwd: props.cwd,
++        path: skill.path,
++        enabled,
++      },
++    });
++    setPendingPath(null);
++  };
++
++  return (
++    <MenuGroup className="w-72">
++      <MenuGroupLabel>Personal skills</MenuGroupLabel>
++      {props.skills.length === 0 ? (
++        <div className="px-2 py-1.5 text-muted-foreground text-sm">No personal skills found.</div>
++      ) : null}
++      {props.skills.map((skill) => (
++        <MenuCheckboxItem
++          key={skill.path}
++          variant="switch"
++          checked={skill.enabled}
++          disabled={pendingPath !== null}
++          closeOnClick={false}
++          onCheckedChange={(enabled) => void toggleSkill(skill, enabled)}
++        >
++          <span className="block truncate">{skill.displayName ?? skill.name}</span>
++        </MenuCheckboxItem>
++      ))}
++    </MenuGroup>
++  );
++}
++
++export const ComposerSkillsMenu = memo(function ComposerSkillsMenu(
++  props: SkillsProps & { size?: "sm" | "xs"; hidden?: boolean },
++) {
++  const size = props.size ?? "sm";
++  const [open, setOpen] = useComposerMenuState(props.hidden);
++  const composerFloatingLayerProps = useComposerMenuProps();
++
++  return (
++    <Menu open={open} onOpenChange={setOpen}>
++      <MenuTrigger
++        render={
++          <ComposerControl
++            size={size}
++            className="shrink-0 whitespace-nowrap"
++            aria-label="Personal skills"
++          />
++        }
++      >
++        <ComposerControlIcon icon={SparklesIcon} size={size} />
++        <span data-composer-control-label>Skills</span>
++      </MenuTrigger>
++      <MenuPopup align="start" {...composerFloatingLayerProps}>
++        <ComposerSkillsSection {...props} />
++      </MenuPopup>
++    </Menu>
++  );
++});

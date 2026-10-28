@@ -1,0 +1,365 @@
+diff --git a/apps/mobile/src/features/threads/ThreadFeed.tsx b/apps/mobile/src/features/threads/ThreadFeed.tsx
+index da127a29..22be76ef 100644
+--- a/apps/mobile/src/features/threads/ThreadFeed.tsx
++++ b/apps/mobile/src/features/threads/ThreadFeed.tsx
+@@ -1,3 +1,4 @@
++import { formatTurnUsage } from "@t3tools/shared/usageFormat";
+ import { Button } from "../../components/ui/Button";
+ import * as Dialog from "../../components/ui/Dialog";
+ import { useOpenPullRequest } from "../../native/useOpenPullRequest";
+@@ -411,6 +412,25 @@ function UserMessageCopyButton(props: {
+   );
+ }
+ 
++function AssistantTurnUsage(props: {
++  readonly environmentId: EnvironmentId;
++  readonly projectedItem: OrchestrationV2ProjectedTurnItem;
++}) {
++  const support = useV2ItemSupport({
++    environmentId: props.environmentId,
++    sourceThreadId: props.projectedItem.sourceThreadId,
++    sourceItemId: props.projectedItem.sourceItemId,
++  });
++  return (
++    <Text
++      className="mt-1 text-xs tabular-nums text-foreground-secondary"
++      accessibilityHint="Usage for the whole agent turn, including tool calls. Reported cost is API-equivalent usage, not a subscription charge. Subscription quota consumption is unavailable."
++    >
++      {formatTurnUsage(support.providerTurn?.turnTokenUsage)}
++    </Text>
++  );
++}
++
+ function AssistantForkButton(props: {
+   readonly environmentId: EnvironmentId;
+   readonly iconColor: ColorValue;
+@@ -1840,6 +1860,12 @@ function renderFeedEntry(
+             onOpenTurnDiff={props.onOpenTurnDiff}
+           />
+         ) : null}
++        {showAssistantMeta && !message.streaming && message.projectedItem ? (
++          <AssistantTurnUsage
++            environmentId={props.environmentId}
++            projectedItem={message.projectedItem}
++          />
++        ) : null}
+         {showAssistantMeta ? (
+           <View className="mt-1 flex-row items-center gap-1">
+             <CopyTextButton
+diff --git a/apps/server/src/provider/ClaudeTurnTokenUsage.ts b/apps/server/src/provider/ClaudeTurnTokenUsage.ts
+index d401fde5..37082c8e 100644
+--- a/apps/server/src/provider/ClaudeTurnTokenUsage.ts
++++ b/apps/server/src/provider/ClaudeTurnTokenUsage.ts
+@@ -54,7 +54,13 @@ function withEarlierSegmentUsage(
+ }
+ 
+ export function normalizeClaudeTurnTokenUsage(
+-  result: { readonly subtype: SDKResultMessage["subtype"]; readonly usage?: unknown } | undefined,
++  result:
++    | {
++        readonly subtype: SDKResultMessage["subtype"];
++        readonly usage?: unknown;
++        readonly total_cost_usd?: number;
++      }
++    | undefined,
+   hasSubagents: boolean,
+   terminalStatus: RuntimeTurnState,
+   earlierSegmentUsage: ReadonlyArray<unknown> = [],
+@@ -104,7 +110,15 @@ export function normalizeClaudeTurnTokenUsage(
+     };
+   }
+ 
++  const cost = result?.total_cost_usd;
+   const commonUsage = {
++    ...(typeof cost === "number" &&
++    Number.isFinite(cost) &&
++    cost >= 0 &&
++    !hasSubagents &&
++    earlierSegmentUsage.length === 0
++      ? { reportedCostUsd: cost }
++      : {}),
+     usageScope: "main_agent",
+     ...(cachedInputTokens !== undefined ? { cachedInputTokens } : {}),
+     ...(cacheCreationTokens !== undefined ? { cacheCreationTokens } : {}),
+diff --git a/apps/server/src/provider/TurnTokenUsage.test.ts b/apps/server/src/provider/TurnTokenUsage.test.ts
+index 25db70f6..5e771bb5 100644
+--- a/apps/server/src/provider/TurnTokenUsage.test.ts
++++ b/apps/server/src/provider/TurnTokenUsage.test.ts
+@@ -102,6 +102,25 @@ describe("billable native turn usage", () => {
+     });
+   });
+ 
++  it("keeps valid reported Claude cost only when it covers the measured turn", () => {
++    const result = {
++      subtype: "success" as const,
++      total_cost_usd: 0.012,
++      usage: { input_tokens: 4, output_tokens: 2 },
++    };
++    expect(normalizeClaudeTurnTokenUsage(result, false, "completed").reportedCostUsd).toBe(0.012);
++    expect(
++      normalizeClaudeTurnTokenUsage(result, true, "completed").reportedCostUsd,
++    ).toBeUndefined();
++    expect(
++      normalizeClaudeTurnTokenUsage(result, false, "completed", [{}]).reportedCostUsd,
++    ).toBeUndefined();
++    expect(
++      normalizeClaudeTurnTokenUsage({ ...result, total_cost_usd: NaN }, false, "completed")
++        .reportedCostUsd,
++    ).toBeUndefined();
++  });
++
+   it("does not turn a zeroed Claude crash result into a measured zero-cost turn", () => {
+     expect(
+       normalizeClaudeTurnTokenUsage(
+diff --git a/apps/server/src/provider/antigravityUsageLimits.test.ts b/apps/server/src/provider/antigravityUsageLimits.test.ts
+index 7c0eeabb..c4eea8df 100644
+--- a/apps/server/src/provider/antigravityUsageLimits.test.ts
++++ b/apps/server/src/provider/antigravityUsageLimits.test.ts
+@@ -79,14 +79,14 @@ const fixture = Effect.fn("AntigravityUsageTest.fixture")(function* (
+       }),
+     );
+   if (!options.missingToken) yield* writeToken(options.refreshToken ?? "refresh-a");
+-  const requests: Array<{ url: string; body: string }> = [];
++  const requests: Array<{ url: string; body: string; userAgent?: string }> = [];
+   const http = HttpClient.make((request, url, _signal, fiber) =>
+     Effect.sync(() => {
+       const init = Context.getOrUndefined(fiber.context, FetchHttpClient.RequestInit);
+       expect(init?.redirect).toBe("manual");
+       const body =
+         request.body._tag === "Uint8Array" ? new TextDecoder().decode(request.body.body) : "";
+-      requests.push({ url: request.url, body });
++      requests.push({ url: request.url, body, userAgent: request.headers["user-agent"] });
+       if (request.url.endsWith("/token")) {
+         expect(new URLSearchParams(body).get("grant_type")).toBe("refresh_token");
+         return HttpClientResponse.fromWeb(
+@@ -152,6 +152,45 @@ describe("Antigravity subscription limits", () => {
+     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+   );
+ 
++  it.effect("requests ACP quota summaries and keeps Gemini 4 Argon separate from Gemini", () =>
++    Effect.gen(function* () {
++      const { probe, requests } = yield* fixture({
++        summary: {
++          groups: [
++            ...summary.groups,
++            {
++              displayName: "Gemini 4 Argon",
++              buckets: [
++                {
++                  bucketId: "gemini-argon-wtu-weekly",
++                  displayName: "Gemini 4 Argon Weekly Limit",
++                  window: "weekly",
++                  remainingFraction: 0.45,
++                  resetTime: "2026-11-03T03:19:19Z",
++                },
++              ],
++            },
++          ],
++        },
++      });
++      const limits = yield* probe;
++      const byId = new Map(limits.windows.map((window) => [window.id, window]));
++      expect(byId.get("gemini-weekly")?.label).toBe("Gemini · Weekly");
++      expect(byId.get("gemini-argon-wtu-weekly")).toMatchObject({
++        label: "Gemini 4 Argon · Weekly",
++        kind: "weekly",
++        windowDurationMins: 10080,
++        resetsAt: "2026-11-03T03:19:19.000Z",
++      });
++      expect(byId.get("gemini-argon-wtu-weekly")?.usedPercent).toBeCloseTo(55);
++      expect(
++        requests
++          .filter((request) => request.url.endsWith(":retrieveUserQuotaSummary"))
++          .every((request) => request.userAgent?.startsWith("antigravity/acp/1.3.0 ")),
++      ).toBe(true);
++    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
++  );
++
+   it.effect("merges quota groups that only one endpoint reports", () =>
+     Effect.gen(function* () {
+       const { probe } = yield* fixture({
+diff --git a/apps/server/src/provider/antigravityUsageLimits.ts b/apps/server/src/provider/antigravityUsageLimits.ts
+index 75333ae8..e924658d 100644
+--- a/apps/server/src/provider/antigravityUsageLimits.ts
++++ b/apps/server/src/provider/antigravityUsageLimits.ts
+@@ -104,7 +104,9 @@ function summaryWindows(summary: typeof Summary.Type) {
+   for (const group of groups ?? []) {
+     for (const bucket of group.buckets ?? []) {
+       if (bucket.disabled) continue;
+-      const family = bucket.bucketId.startsWith("gemini-")
++      // Only shared Gemini buckets (`gemini-5h`, `gemini-weekly`) use the generic "Gemini" label;
++      // separate buckets like `gemini-argon-wtu-weekly` keep their group displayName ("Gemini 4 Argon").
++      const family = /^gemini-[5w]/.test(bucket.bucketId)
+         ? "Gemini"
+         : bucket.bucketId.startsWith("3p-")
+           ? "Claude & GPT (shared)"
+@@ -257,7 +259,8 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
+             HttpClientRequest.post(`${endpoint}/v1internal:${operation}`).pipe(
+               HttpClientRequest.setHeaders({
+                 Authorization: `Bearer ${accessToken}`,
+-                "User-Agent": `antigravity/hub/1.0.0 (aidev_client; os_type=${platform}; arch=${architecture}; cl=963137146)`,
++                // Google filters out Gemini and Argon quota groups when called with `antigravity/hub/1.0.0`.
++                "User-Agent": `antigravity/acp/1.3.0 (aidev_client; os_type=${platform}; arch=${architecture}; cl=963137146)`,
+               }),
+               HttpClientRequest.bodyJsonUnsafe(
+                 token.project_id ? { project: token.project_id } : {},
+diff --git a/apps/web/src/components/chat/TimelineAssistantRows.tsx b/apps/web/src/components/chat/TimelineAssistantRows.tsx
+index 89b52ae5..3e750da4 100644
+--- a/apps/web/src/components/chat/TimelineAssistantRows.tsx
++++ b/apps/web/src/components/chat/TimelineAssistantRows.tsx
+@@ -1,3 +1,4 @@
++import { formatTurnUsage } from "@t3tools/shared/usageFormat";
+ import { shouldPreserveAssistantLineBreaks } from "@t3tools/shared/markdownPipeline";
+ import { type RunId } from "@t3tools/contracts";
+ import { canForkProjectedAssistantItem } from "@t3tools/client-runtime/state/thread-workflows";
+@@ -61,6 +62,9 @@ export function AssistantTimelineRow({ row }: { row: Extract<TimelineRow, { kind
+             onOpenTurnDiff={ctx.onOpenTurnDiff}
+           />
+         ) : null}
++        {row.showAssistantMeta && !row.message.streaming && row.projectedItem ? (
++          <AssistantTurnUsage projectedItem={row.projectedItem} />
++        ) : null}
+         {row.showAssistantMeta ? (
+           <AssistantMessageMeta
+             className="mt-1.5"
+@@ -75,6 +79,33 @@ export function AssistantTimelineRow({ row }: { row: Extract<TimelineRow, { kind
+   );
+ }
+ 
++function AssistantTurnUsage({
++  projectedItem,
++}: {
++  readonly projectedItem: NonNullable<Extract<TimelineRow, { kind: "message" }>["projectedItem"]>;
++}) {
++  const ctx = use(TimelineRowCtx);
++  const support = useV2ItemSupport({
++    environmentId: ctx.activeThreadEnvironmentId,
++    sourceThreadId: projectedItem.sourceThreadId,
++    sourceItemId: projectedItem.sourceItemId,
++  });
++  return (
++    <Tooltip>
++      <TooltipTrigger
++        render={<p tabIndex={0} className="mt-1.5 text-xs tabular-nums text-muted-foreground" />}
++      >
++        {formatTurnUsage(support.providerTurn?.turnTokenUsage)}
++      </TooltipTrigger>
++      <TooltipPopup>
++        Usage for the whole agent turn, including tool calls. Cached tokens are included in input.
++        Reported cost is API-equivalent usage, not a subscription charge; subscription quota
++        consumption is unavailable.
++      </TooltipPopup>
++    </Tooltip>
++  );
++}
++
+ function AssistantForkButton({
+   projectedItem,
+ }: {
+@@ -129,6 +160,9 @@ export function AssistantMetaTimelineRow({
+ }) {
+   return (
+     <div className="px-1">
++      {!row.message.streaming && row.projectedItem ? (
++        <AssistantTurnUsage projectedItem={row.projectedItem} />
++      ) : null}
+       <AssistantMessageMeta
+         className="mt-0.5"
+         projectedItem={row.projectedItem}
+diff --git a/packages/contracts/src/providerRuntime.ts b/packages/contracts/src/providerRuntime.ts
+index 4740a9fd..f22ad9ea 100644
+--- a/packages/contracts/src/providerRuntime.ts
++++ b/packages/contracts/src/providerRuntime.ts
+@@ -55,6 +55,7 @@ export type ThreadTokenUsageSnapshot = typeof ThreadTokenUsageSnapshot.Type;
+ 
+ // Input includes cache reads/writes; output includes the optional reasoningTokens subset.
+ const TurnTokenUsageCommonFields = {
++  reportedCostUsd: Schema.optional(Schema.Number.check(Schema.isGreaterThanOrEqualTo(0))),
+   usageScope: Schema.Literal("main_agent"),
+   cachedInputTokens: Schema.optional(NonNegativeInt),
+   cacheCreationTokens: Schema.optional(NonNegativeInt),
+diff --git a/packages/shared/src/usageFormat.test.ts b/packages/shared/src/usageFormat.test.ts
+index 73d4e357..d049cc20 100644
+--- a/packages/shared/src/usageFormat.test.ts
++++ b/packages/shared/src/usageFormat.test.ts
+@@ -1,7 +1,7 @@
+ // @effect-diagnostics globalDate:off -- A fixed instant keeps calendar-window assertions deterministic.
+ import { describe, expect, it, vi } from "vite-plus/test";
+ 
+-import { formatHourShort, makeWindow } from "./usageFormat.ts";
++import { formatHourShort, formatTurnUsage, makeWindow } from "./usageFormat.ts";
+ 
+ describe("hourly usage formatting", () => {
+   it("keeps requested zones separate when formatting repeated calls", () => {
+@@ -52,3 +52,31 @@ describe("hourly usage formatting", () => {
+     }
+   });
+ });
++
++describe("turn usage formatting", () => {
++  it("reports input and output without double-counting cache or reasoning", () => {
++    expect(
++      formatTurnUsage({
++        usageScope: "main_agent",
++        usageStatus: "complete",
++        inputTokens: 150,
++        cachedInputTokens: 40,
++        outputTokens: 20,
++        reasoningTokens: 10,
++        hasSubagents: false,
++        reportedCostUsd: 0.01234,
++      }),
++    ).toBe("Turn: 150 input (40 cached) · 20 output tokens · $0.0123 reported cost");
++  });
++  it("distinguishes missing usage from zero and labels partial main-agent totals", () => {
++    expect(formatTurnUsage(undefined)).toBe("Turn tokens unavailable · Cost unavailable");
++    expect(
++      formatTurnUsage({
++        usageScope: "main_agent",
++        usageStatus: "partial",
++        inputTokens: 0,
++        hasSubagents: true,
++      }),
++    ).toBe("Partial turn: 0 input · ? output tokens · Cost unavailable · Main agent only");
++  });
++});
+diff --git a/packages/shared/src/usageFormat.ts b/packages/shared/src/usageFormat.ts
+index 8c979235..1e0258b9 100644
+--- a/packages/shared/src/usageFormat.ts
++++ b/packages/shared/src/usageFormat.ts
+@@ -1,5 +1,10 @@
+ // @effect-diagnostics globalDate:off -- Usage windows are calendar days in the viewer's zone, derived from wall-clock "now" via Intl.
+-import { UsageDay, type UsageResolution, type UsageSummaryInput } from "@t3tools/contracts";
++import {
++  UsageDay,
++  type TurnTokenUsage,
++  type UsageResolution,
++  type UsageSummaryInput,
++} from "@t3tools/contracts";
+ 
+ import type { UsageContractMismatch } from "./usageMerge.ts";
+ 
+@@ -29,6 +34,23 @@ export function formatTokens(value: number): string {
+   return INTEGER.format(Math.round(value));
+ }
+ 
++export function formatTurnUsage(usage: TurnTokenUsage | undefined): string {
++  if (usage === undefined || usage.usageStatus === "unavailable") {
++    return "Turn tokens unavailable · Cost unavailable";
++  }
++  const input = usage.inputTokens === undefined ? "?" : formatCount(usage.inputTokens);
++  const output = usage.outputTokens === undefined ? "?" : formatCount(usage.outputTokens);
++  const cached =
++    usage.cachedInputTokens === undefined
++      ? ""
++      : ` (${formatCount(usage.cachedInputTokens)} cached)`;
++  const cost =
++    usage.reportedCostUsd === undefined
++      ? "Cost unavailable"
++      : `$${usage.reportedCostUsd.toFixed(4)} reported cost`;
++  return `${usage.usageStatus === "partial" ? "Partial turn" : "Turn"}: ${input} input${cached} · ${output} output tokens · ${cost}${usage.hasSubagents ? " · Main agent only" : ""}`;
++}
++
+ function trim(value: number): string {
+   const abs = Math.abs(value);
+   const digits = abs >= 100 ? 0 : abs >= 10 ? 1 : 2;
