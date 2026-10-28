@@ -42,6 +42,12 @@ class InstallerTests(unittest.TestCase):
                     first = target.read_bytes()
                     patch('skill-toggle', resources)
                     self.assertEqual(target.read_bytes(), first)
+                    stale = Asar(target.read_bytes())
+                    state = json.loads(stale.read(MARKER))
+                    state['payload_revision'] = 'old'
+                    target.write_bytes(stale.rebuild({MARKER: json.dumps(state).encode()}))
+                    patch('skill-toggle', resources)
+                    self.assertEqual(target.read_bytes(), first)
                     patch('show-all-usage', resources)
                     archive = Asar(target.read_bytes())
                     self.assertEqual(archive.read('native/keep'), b'unchanged platform library')
@@ -59,6 +65,7 @@ class InstallerTests(unittest.TestCase):
         for features in ({'skill-toggle'}, {'show-all-usage'}, {'skill-toggle', 'show-all-usage'}):
             data = b'\n'.join(load_payload(features).values())
             self.assertEqual(b'Personal skills' in data, 'skill-toggle' in features)
+            self.assertEqual(b'Usage limits unavailable for this provider' in data, 'show-all-usage' in features)
             self.assertEqual(b'reported cost' in data, 'show-all-usage' in features)
             self.assertEqual(b'antigravity/acp/1.3.0' in data, 'show-all-usage' in features)
 

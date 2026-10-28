@@ -168,7 +168,8 @@ def patch(feature, install, check=False, restore=False):
         # Preserve features already installed on the captured local app.
         if digest(data) == known_local:
             features = {'skill-toggle', 'show-all-usage'}
-    if feature in features:
+    revision = (ROOT / 'payload/manifest.sha256').read_text().strip()
+    if feature in features and state and state.get('payload_revision') == revision:
         print(f'{feature}: already installed.')
         return
     features.add(feature)
@@ -178,6 +179,7 @@ def patch(feature, install, check=False, restore=False):
         state = {'backup': target.name + '.original-' + original_sha[:16] + '.bak',
                  'original_sha256': original_sha}
     state['features'] = sorted(features)
+    state['payload_revision'] = revision
     replacements[MARKER] = (json.dumps(state, indent=2) + '\n').encode()
     # Remove obsolete hashed bundles; preserve every other archive subtree and native sidecar.
     archive.node('apps/server')['files']['dist'] = {'files': {}}

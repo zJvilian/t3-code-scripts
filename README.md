@@ -27,7 +27,7 @@ Append `--check` for a dry run or `--restore` to restore the original archive. A
 
 ## Supported installation
 
-This is a captured build, not a patch for arbitrary future releases. It supports **0.1.4-nightly.20261028.3824** (source commit `eb751fa0730d6a51d56547cb7fcaf4822a7e0e3b`). It also recognizes Julian's exact existing modified Linux archive and reports that both features are already installed. Other releases are refused without changes.
+This is a captured build, not a patch for arbitrary future releases. It supports **0.1.4-nightly.20261028.3824** (source commit `eb751fa0730d6a51d56547cb7fcaf4822a7e0e3b`). It also recognizes Julian's exact existing modified Linux archive and preserves both features when upgrading. Other releases are refused without changes.
 
 The installers replace the compiled server/UI subtree, preserving the desktop shell, bundled native libraries, and other archive contents. Other custom modifications inside that subtree are replaced. Accounts, settings, conversations, and provider installations are not touched. These do not modify separate CLI installations or remote servers.
 
@@ -55,7 +55,7 @@ py -3 show-all-usage.py "C:\path\to\T3 Code"
 
 Use your real installation directory (the folder containing `resources`). If Python is available as `python` instead of `py`, use `python`. An installation under Program Files may require an elevated terminal. The scripts automatically select `resources/server.asar` for the Windows server sidecar; otherwise they use `resources/app.asar`. Native `.asar.unpacked` files are retained.
 
-Run either script or both, in either order, then restart T3 Code. The second script preserves the first feature. Repeat runs report “already installed”. `--check` validates compatibility and payloads without writing to the installation.
+Run either script or both, in either order, then restart T3 Code. The second script preserves the first feature. Repeat runs report “already installed” when the payload revision matches; older revisions are upgraded. `--check` validates compatibility and payloads without writing to the installation.
 
 ## Backup and restore
 
@@ -83,4 +83,6 @@ Updates can replace the patched archive. Do not force these captured bundles ont
 Three variants were built from the pinned source plus the independent patches in `patches/`: skills only, usage only, and both. `payload/runtime.zip` stores deduplicated compiled files; `manifest.json` maps each variant to SHA-256 content hashes. Source maps are omitted. T3's MIT license is in `payload/LICENSE-T3Code.txt`; built third-party notices are included in the runtime payload.
 
 The real Linux archive was patched in a temporary installation and smoke-tested using Electron with a separate temporary data directory, then restored byte-for-byte. The running user installation was not modified. Full interactive UI behavior and a real Windows launch remain untested.
+Copilot and other available providers without quota reporting now appear with an explicit unavailable notice. Numerical Copilot quotas are not exposed by this build’s ACP integration. The usage payload contains a targeted compiled equivalent of the shared notice fix.
+
 # t3-code-scripts

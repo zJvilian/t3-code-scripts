@@ -363,3 +363,16 @@ index 8c979235..1e0258b9 100644
  function trim(value: number): string {
    const abs = Math.abs(value);
    const digits = abs >= 100 ? 0 : abs >= 10 ? 1 : 2;
+diff --git a/packages/shared/src/usageLimits.ts b/packages/shared/src/usageLimits.ts
+--- a/packages/shared/src/usageLimits.ts
++++ b/packages/shared/src/usageLimits.ts
+@@ -294,3 +294,6 @@
+-    for (const provider of providersWithLimits(presentation.serverConfig?.providers ?? [])) {
+-      if (provider.usageLimits?.unavailable?.reason === "unsupported") continue;
+-      const notice = provider.usageLimits ? limitsNotice(provider.usageLimits) : null;
++    for (const provider of (presentation.serverConfig?.providers ?? []).filter(
++      (provider) => provider.enabled && provider.installed && isProviderAvailable(provider),
++    )) {
++      const notice = provider.usageLimits
++        ? limitsNotice(provider.usageLimits)
++        : "Usage limits unavailable for this provider";
